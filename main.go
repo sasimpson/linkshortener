@@ -8,18 +8,20 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 type Env struct {
 	DB *sql.DB
+	MC *memcache.Client
 }
 
 type URL struct {
 	ID      int64  `json:"id"`
 	URL     string `json:"url"`
-	Sig     string `json:"-"`
+	Sig     string `json:"sig"`
 	TinyURL string `json:"tinyurl"`
 }
 
@@ -28,6 +30,9 @@ func main() {
 
 	db, err := sql.Open("sqlite3", "database.sqlite3")
 	env.DB = db
+
+	env.MC = memcache.New("127.0.0.1:11211")
+
 	if err != nil {
 		panic(err)
 	}
@@ -38,6 +43,7 @@ func main() {
 	http.ListenAndServe(":5000", r)
 }
 
+//Shorten - this handler will return json containing the url info
 func Shorten(env *Env) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var newURL URL
@@ -66,6 +72,7 @@ func Shorten(env *Env) http.Handler {
 
 		result, err := env.DB.Exec("INSERT INTO urls (url, sig) values (?, ?)", newURL.URL, newURL.Sig)
 		newURL.ID, _ = result.LastInsertId()
+
 		w.WriteHeader(http.StatusCreated)
 		encoder := json.NewEncoder(w)
 		err = encoder.Encode(newURL)
@@ -73,24 +80,56 @@ func Shorten(env *Env) http.Handler {
 	})
 }
 
+//Visit - this handler will take the id of the tinyurl and return a redirect to the proper url
 func Visit(env *Env) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
 		if id, ok := vars["id"]; ok {
 			var url URL
-			row := env.DB.QueryRow("SELECT id, url, sig from urls where id = ?", id)
-			err := row.Scan(&url.ID, &url.URL, &url.Sig)
-			if err != nil {
-				if err.Error() == "sql: no rows in result set" {
-					http.Error(w, "Not Found", http.StatusNotFound)
+			//check for url in cache first:
+			mcData, err := env.MC.Get(id)
+			//hit:
+			if err == nil {
+				log.Printf("%s", mcData.Value)
+				err = json.Unmarshal(mcData.Value, &url)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
+
+				if url.URL != "" {
+					w.Header().Set("x-redirect-sum", url.Sig)
+					w.Header().Set("x-cache-hit", "true")
+					http.Redirect(w, r, url.URL, http.StatusFound)
+					return
+				}
 			}
-			if url.URL != "" {
-				w.Header().Set("x-redirect-sum", url.Sig)
-				http.Redirect(w, r, url.URL, http.StatusFound)
+
+			//miss:
+			if err == memcache.ErrCacheMiss {
+				row := env.DB.QueryRow("SELECT id, url, sig from urls where id = ?", id)
+				err = row.Scan(&url.ID, &url.URL, &url.Sig)
+				if err != nil {
+					if err.Error() == "sql: no rows in result set" {
+						http.Error(w, "Not Found", http.StatusNotFound)
+						return
+					}
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				if url.URL != "" {
+					js, err := json.Marshal(url)
+					if err == nil {
+						env.MC.Set(&memcache.Item{Key: fmt.Sprintf("%d", url.ID), Value: js})
+					}
+					w.Header().Set("x-redirect-sum", url.Sig)
+					w.Header().Set("x-cache-hit", "false")
+					http.Redirect(w, r, url.URL, http.StatusFound)
+					return
+				}
+			}
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 		}
